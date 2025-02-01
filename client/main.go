@@ -27,13 +27,14 @@ var (
 	dataChannel       *webrtc.DataChannel
 	mut               sync.Mutex
 	connectedPeer     string
-	isOfferer         bool
 	pendingCandidates []webrtc.ICECandidateInit
 )
 
 func main() {
 	serverIP := os.Args[1]
 	dialAddr := fmt.Sprintf("ws://%s:42069/ws", serverIP)
+	log.SetFlags(log.Ltime | log.Lshortfile)
+
 	// Connect to signaling server
 	var err error
 	signalingSrv, _, err = websocket.DefaultDialer.Dial(dialAddr, nil)
@@ -42,7 +43,7 @@ func main() {
 	}
 	defer signalingSrv.Close()
 
-	// Initialize WebRTC
+	// Initialize WebRTC configuration
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -51,51 +52,17 @@ func main() {
 		},
 	}
 
-	createNewPeerConnection := func() error {
-		if peerConnection != nil {
-			peerConnection.Close()
-		}
-
-		peerConnection, err = webrtc.NewPeerConnection(config)
-		if err != nil {
-			return err
-		}
-
-		peerConnection.OnICECandidate(func(ice *webrtc.ICECandidate) {
-			if ice != nil && connectedPeer != "" {
-				candidateJSON, err := json.Marshal(ice.ToJSON())
-				if err != nil {
-					return
-				}
-				signalingSrv.WriteJSON(Message{
-					Type:    "ice-candidate",
-					To:      connectedPeer,
-					Payload: candidateJSON,
-				})
-			}
-		})
-
-		peerConnection.OnDataChannel(func(dc *webrtc.DataChannel) {
-			log.Printf("Received data channel\n")
-			dataChannel = dc
-			setupDataChannel(dc)
-		})
-
-		peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-			log.Printf("Connection state changed: %s\n", state.String())
-		})
-
-		return nil
-	}
-
-	err = createNewPeerConnection()
+	// Create initial peer connection
+	peerConnection, err = webrtc.NewPeerConnection(config)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer peerConnection.Close()
+
+	// Set up peer connection handlers
+	setupPeerConnection(peerConnection)
 
 	// Listen for messages from signaling server
-	go handleSignalingMessages(createNewPeerConnection)
+	go handleSignalingMessages()
 
 	// Handle user input
 	fmt.Println("Type your messages (press Enter to send):")
@@ -106,17 +73,52 @@ func main() {
 			dataChannel.SendText(text)
 			fmt.Printf("You: %s\n", text)
 		} else {
-			fmt.Println("Not connected to peer yet")
+			fmt.Println("Not connected to peer yet. Waiting for connection...")
 		}
 	}
 }
 
-func handleSignalingMessages(createNewPeerConnection func() error) {
+func setupPeerConnection(pc *webrtc.PeerConnection) {
+	// Handle ICE candidate generation
+	pc.OnICECandidate(func(ice *webrtc.ICECandidate) {
+		if ice != nil && connectedPeer != "" {
+			candidateJSON, err := json.Marshal(ice.ToJSON())
+			if err != nil {
+				log.Printf("Failed to marshal ICE candidate: %v", err)
+				return
+			}
+			signalingSrv.WriteJSON(Message{
+				Type:    "ice-candidate",
+				To:      connectedPeer,
+				Payload: candidateJSON,
+			})
+		}
+	})
+
+	// Handle incoming data channels
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		log.Printf("Received data channel: %s\n", dc.Label())
+		dataChannel = dc
+		setupDataChannel(dc)
+	})
+
+	// Monitor connection state changes
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("Connection state changed to: %s\n", state.String())
+		if state == webrtc.PeerConnectionStateFailed {
+			// Connection failed, try to reconnect
+			log.Println("Connection failed, requesting new peer list")
+			signalingSrv.WriteJSON(Message{Type: "get_peers"})
+		}
+	})
+}
+
+func handleSignalingMessages() {
 	for {
 		var msg Message
 		err := signalingSrv.ReadJSON(&msg)
 		if err != nil {
-			log.Println("read:", err)
+			log.Printf("Signaling server read error: %v", err)
 			return
 		}
 
@@ -126,84 +128,45 @@ func handleSignalingMessages(createNewPeerConnection func() error) {
 			json.Unmarshal(msg.Payload, &id)
 			myID = id
 			log.Printf("Connected to server with ID: %s", myID)
+			// Request peer list after getting ID
+			signalingSrv.WriteJSON(Message{Type: "get_peers"})
 
 		case "peers":
 			var peers []string
 			json.Unmarshal(msg.Payload, &peers)
-
-			// Reset connection state if we see new peers
-			if len(peers) > 0 && peers[0] != connectedPeer {
-				connectedPeer = peers[0]
-				isOfferer = myID > connectedPeer
-
-				// Create new peer connection
-				err := createNewPeerConnection()
-				if err != nil {
-					log.Printf("Error creating new peer connection: %v", err)
-					continue
-				}
-
-				if isOfferer {
-					// Wait a bit before creating offer to avoid race conditions
-					time.Sleep(time.Second)
-					log.Printf("Creating offer for peer: %s", connectedPeer)
-					createOffer()
-				} else {
-					log.Printf("Waiting for offer from peer: %s", connectedPeer)
+			if len(peers) > 0 {
+				peer := peers[0]
+				if peer != connectedPeer {
+					connectedPeer = peer
+					if myID > peer {
+						log.Printf("Initiating connection with peer: %s", peer)
+						// Small delay to ensure both sides are ready
+						time.Sleep(500 * time.Millisecond)
+						initiateConnection()
+					} else {
+						log.Printf("Waiting for connection from peer: %s", peer)
+					}
 				}
 			}
 
 		case "offer":
-			if msg.From == connectedPeer && !isOfferer {
-				var offer webrtc.SessionDescription
-				json.Unmarshal(msg.Payload, &offer)
-				handleOffer(msg.From, offer)
-			}
+			handleOffer(msg.From, msg.Payload)
 
 		case "answer":
-			if msg.From == connectedPeer && isOfferer {
-				var answer webrtc.SessionDescription
-				json.Unmarshal(msg.Payload, &answer)
-				err := peerConnection.SetRemoteDescription(answer)
-				if err != nil {
-					log.Printf("Error setting remote description: %v", err)
-				}
-
-				// Add any pending candidates
-				for _, candidate := range pendingCandidates {
-					err := peerConnection.AddICECandidate(candidate)
-					if err != nil {
-						log.Printf("Error adding pending ICE candidate: %v", err)
-					}
-				}
-				pendingCandidates = nil
-			}
+			handleAnswer(msg.From, msg.Payload)
 
 		case "ice-candidate":
-			if msg.From == connectedPeer {
-				var candidate webrtc.ICECandidateInit
-				json.Unmarshal(msg.Payload, &candidate)
-
-				// If we haven't set the remote description yet, store the candidate
-				if peerConnection.RemoteDescription() == nil {
-					pendingCandidates = append(pendingCandidates, candidate)
-				} else {
-					err := peerConnection.AddICECandidate(candidate)
-					if err != nil {
-						log.Printf("Error adding ICE candidate: %v", err)
-					}
-				}
-			}
+			handleICECandidate(msg.Payload)
 		}
 	}
 }
 
-func createOffer() {
+func initiateConnection() {
 	// Create data channel
 	var err error
 	dataChannel, err = peerConnection.CreateDataChannel("chat", nil)
 	if err != nil {
-		log.Printf("Error creating data channel: %v", err)
+		log.Printf("Failed to create data channel: %v", err)
 		return
 	}
 	setupDataChannel(dataChannel)
@@ -211,19 +174,19 @@ func createOffer() {
 	// Create offer
 	offer, err := peerConnection.CreateOffer(nil)
 	if err != nil {
-		log.Printf("Error creating offer: %v", err)
+		log.Printf("Failed to create offer: %v", err)
 		return
 	}
 
 	err = peerConnection.SetLocalDescription(offer)
 	if err != nil {
-		log.Printf("Error setting local description: %v", err)
+		log.Printf("Failed to set local description: %v", err)
 		return
 	}
 
 	offerJSON, err := json.Marshal(offer)
 	if err != nil {
-		log.Printf("Error marshaling offer: %v", err)
+		log.Printf("Failed to marshal offer: %v", err)
 		return
 	}
 
@@ -234,53 +197,85 @@ func createOffer() {
 	})
 }
 
-func handleOffer(peerID string, offer webrtc.SessionDescription) {
-	log.Printf("Received offer from peer: %s", peerID)
-
-	err := peerConnection.SetRemoteDescription(offer)
+func handleOffer(from string, payload json.RawMessage) {
+	var offer webrtc.SessionDescription
+	err := json.Unmarshal(payload, &offer)
 	if err != nil {
-		log.Printf("Error setting remote description: %v", err)
+		log.Printf("Failed to unmarshal offer: %v", err)
 		return
 	}
 
-	// Add any pending candidates
-	for _, candidate := range pendingCandidates {
-		err := peerConnection.AddICECandidate(candidate)
-		if err != nil {
-			log.Printf("Error adding pending ICE candidate: %v", err)
-		}
+	log.Printf("Received offer from: %s", from)
+	err = peerConnection.SetRemoteDescription(offer)
+	if err != nil {
+		log.Printf("Failed to set remote description: %v", err)
+		return
 	}
-	pendingCandidates = nil
 
 	// Create answer
 	answer, err := peerConnection.CreateAnswer(nil)
 	if err != nil {
-		log.Printf("Error creating answer: %v", err)
+		log.Printf("Failed to create answer: %v", err)
 		return
 	}
 
 	err = peerConnection.SetLocalDescription(answer)
 	if err != nil {
-		log.Printf("Error setting local description: %v", err)
+		log.Printf("Failed to set local description: %v", err)
 		return
 	}
 
 	answerJSON, err := json.Marshal(answer)
 	if err != nil {
-		log.Printf("Error marshaling answer: %v", err)
+		log.Printf("Failed to marshal answer: %v", err)
 		return
 	}
 
 	signalingSrv.WriteJSON(Message{
 		Type:    "answer",
-		To:      peerID,
+		To:      from,
 		Payload: answerJSON,
 	})
 }
 
+func handleAnswer(from string, payload json.RawMessage) {
+	var answer webrtc.SessionDescription
+	err := json.Unmarshal(payload, &answer)
+	if err != nil {
+		log.Printf("Failed to unmarshal answer: %v", err)
+		return
+	}
+
+	log.Printf("Received answer from: %s", from)
+	err = peerConnection.SetRemoteDescription(answer)
+	if err != nil {
+		log.Printf("Failed to set remote description: %v", err)
+		return
+	}
+}
+
+func handleICECandidate(payload json.RawMessage) {
+	var candidate webrtc.ICECandidateInit
+	err := json.Unmarshal(payload, &candidate)
+	if err != nil {
+		log.Printf("Failed to unmarshal ICE candidate: %v", err)
+		return
+	}
+
+	if peerConnection.RemoteDescription() == nil {
+		pendingCandidates = append(pendingCandidates, candidate)
+		return
+	}
+
+	err = peerConnection.AddICECandidate(candidate)
+	if err != nil {
+		log.Printf("Failed to add ICE candidate: %v", err)
+	}
+}
+
 func setupDataChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
-		log.Printf("Data channel '%s'-'%d' open. You can now send messages\n", dc.Label(), dc.ID())
+		log.Printf("Data channel '%s' opened - you can now send messages\n", dc.Label())
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -288,7 +283,11 @@ func setupDataChannel(dc *webrtc.DataChannel) {
 	})
 
 	dc.OnClose(func() {
-		log.Println("Data channel closed")
+		log.Printf("Data channel '%s' closed\n", dc.Label())
 		dataChannel = nil
+	})
+
+	dc.OnError(func(err error) {
+		log.Printf("Data channel error: %v", err)
 	})
 }
