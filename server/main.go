@@ -124,6 +124,6 @@ func generateID() string {
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-	log.Printf("Starting server on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Printf("Starting server on :42069")
+	log.Fatal(http.ListenAndServe(":42069", nil))
 }

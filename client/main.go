@@ -29,8 +29,10 @@ var (
 
 func main() {
 	// Connect to signaling server
+	serverIP := os.Args[1]
+	dialAddr := fmt.Sprintf("ws://%s:42069/ws", serverIP)
 	var err error
-	signalingSrv, _, err = websocket.DefaultDialer.Dial("ws://localhost:8080/ws", nil)
+	signalingSrv, _, err = websocket.DefaultDialer.Dial(dialAddr, nil)
 	if err != nil {
 		log.Fatal("dial:", err)
 	}
