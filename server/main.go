@@ -27,7 +27,7 @@ type Message struct {
 var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all connections in this example
+			return true
 		},
 	}
 	connections = struct {
@@ -45,29 +45,24 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a random ID for this connection
 	id := generateID()
 	connection := &Connection{
 		ID:   id,
 		Conn: conn,
 	}
 
-	// Store the connection
 	connections.Lock()
 	connections.m[id] = connection
 	connections.Unlock()
 
-	// Send the client their ID
 	conn.WriteJSON(Message{
 		Type:    "id",
 		From:    "server",
 		Payload: json.RawMessage(`"` + id + `"`),
 	})
 
-	// Send list of available peers
 	sendPeerList(connection)
 
-	// Handle incoming messages
 	go handleMessages(connection)
 }
 
@@ -87,10 +82,8 @@ func handleMessages(conn *Connection) {
 			return
 		}
 
-		// Handle message based on type
 		switch msg.Type {
 		case "offer", "answer", "ice-candidate":
-			// Forward the message to the specified peer
 			connections.RLock()
 			if peer, ok := connections.m[msg.To]; ok {
 				msg.From = conn.ID
