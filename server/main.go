@@ -50,7 +50,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		ID:   id,
 		Conn: conn,
 	}
-
+	fmt.Println("New connection from id: ", id)
 	connections.Lock()
 	connections.m[id] = connection
 	connections.Unlock()
@@ -61,14 +61,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Payload: json.RawMessage(`"` + id + `"`),
 	})
 
+	fmt.Println("Sending peer list to it ")
 	sendPeerList(connection)
 
 	go handleMessages(connection)
 }
 
 func handleMessages(conn *Connection) {
+	fmt.Println("now handling messages")
 	defer func() {
 		connections.Lock()
+		fmt.Println("connection lost, deleting ID", conn.ID)
 		delete(connections.m, conn.ID)
 		connections.Unlock()
 		conn.Conn.Close()
@@ -84,9 +87,11 @@ func handleMessages(conn *Connection) {
 
 		switch msg.Type {
 		case "offer", "answer", "ice-candidate":
+			log.Println("Received this message from connection ID : MESSAGE ", conn.ID, msg)
 			connections.RLock()
 			if peer, ok := connections.m[msg.To]; ok {
 				msg.From = conn.ID
+				fmt.Println("writing this message back to connection ", peer.Conn.RemoteAddr().String(), msg)
 				peer.Conn.WriteJSON(msg)
 			}
 			connections.RUnlock()
@@ -104,6 +109,7 @@ func sendPeerList(conn *Connection) {
 	}
 	connections.RUnlock()
 
+	fmt.Println("sent peer list: ", peers)
 	conn.Conn.WriteJSON(Message{
 		Type:    "peers",
 		From:    "server",
